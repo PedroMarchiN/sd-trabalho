@@ -1,0 +1,7 @@
+# requirements.txt
+pyzmq>=25.0
+msgpack>=1.0
+pyaudio>=0.2.13
+opencv-python>=4.8
+numpy>=1.24
+Pillow>=10.0

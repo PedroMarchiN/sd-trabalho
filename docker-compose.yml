@@ -1,0 +1,157 @@
+version: "3.9"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# docker-compose.yml — Cluster de Brokers + Registry + Clientes CLI
+#
+# Subir infra (broker + registry):
+#   docker-compose up --build registry broker-1 broker-2 broker-3
+#
+# Abrir cliente interativo (em outro terminal):
+#   docker-compose run --rm -it client python -m client.client --id alice --room A
+#   docker-compose run --rm -it client python -m client.client --id bob   --room A
+#
+# Ou, para subir tudo junto (clientes saem imediatamente sem TTY):
+#   docker-compose up --build
+#
+# Portas:
+#   registry : 5550
+#   broker-1 : 5555-5559  (+0 XSUB, +1 XPUB, +2 ROUTER, +3 PUB, +4 SUB)
+#   broker-2 : 5565-5569
+#   broker-3 : 5575-5579
+# ─────────────────────────────────────────────────────────────────────────────
+
+networks:
+  videoconf:
+    driver: bridge
+
+services:
+
+  # ── Registry ────────────────────────────────────────────────────────────────
+  registry:
+    build:
+      context: .
+      dockerfile: registry/Dockerfile
+    container_name: registry
+    hostname: registry
+    networks:
+      - videoconf
+    ports:
+      - "5550:5550"
+    environment:
+      REGISTRY_PORT:     "5550"
+      BROKER_HOST:       "0.0.0.0"
+      HEARTBEAT_TIMEOUT: "5.0"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import zmq,msgpack;c=zmq.Context();s=c.socket(zmq.REQ);s.setsockopt(zmq.RCVTIMEO,2000);s.setsockopt(zmq.LINGER,0);s.connect('tcp://localhost:5550');s.send(msgpack.packb({'v':1,'id':'hc','type':'control','from':'hc','room':'_','ts':0,'data':{'action':'list_brokers'}},use_bin_type=True));s.recv()\""]
+      interval:     5s
+      timeout:      4s
+      retries:      10
+      start_period: 10s
+
+  # ── Broker 1 ────────────────────────────────────────────────────────────────
+  broker-1:
+    build:
+      context: .
+      dockerfile: broker/Dockerfile
+    container_name: broker-1
+    hostname: broker-1
+    networks:
+      - videoconf
+    ports:
+      - "5555:5555"
+      - "5556:5556"
+      - "5557:5557"
+      - "5558:5558"
+      - "5559:5559"
+    environment:
+      BROKER_ID:             "broker-1"
+      BROKER_ADVERTISE_HOST: "broker-1"
+      BROKER_BASE_PORT:      "5555"
+      REGISTRY_HOST:         "registry"
+      REGISTRY_PORT:         "5550"
+      HEARTBEAT_INTERVAL:    "1.0"
+      HEARTBEAT_TIMEOUT:     "5.0"
+    depends_on:
+      registry:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ── Broker 2 ────────────────────────────────────────────────────────────────
+  broker-2:
+    build:
+      context: .
+      dockerfile: broker/Dockerfile
+    container_name: broker-2
+    hostname: broker-2
+    networks:
+      - videoconf
+    ports:
+      - "5565:5565"
+      - "5566:5566"
+      - "5567:5567"
+      - "5568:5568"
+      - "5569:5569"
+    environment:
+      BROKER_ID:             "broker-2"
+      BROKER_ADVERTISE_HOST: "broker-2"
+      BROKER_BASE_PORT:      "5565"
+      REGISTRY_HOST:         "registry"
+      REGISTRY_PORT:         "5550"
+      HEARTBEAT_INTERVAL:    "1.0"
+      HEARTBEAT_TIMEOUT:     "5.0"
+    depends_on:
+      registry:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ── Broker 3 ────────────────────────────────────────────────────────────────
+  broker-3:
+    build:
+      context: .
+      dockerfile: broker/Dockerfile
+    container_name: broker-3
+    hostname: broker-3
+    networks:
+      - videoconf
+    ports:
+      - "5575:5575"
+      - "5576:5576"
+      - "5577:5577"
+      - "5578:5578"
+      - "5579:5579"
+    environment:
+      BROKER_ID:             "broker-3"
+      BROKER_ADVERTISE_HOST: "broker-3"
+      BROKER_BASE_PORT:      "5575"
+      REGISTRY_HOST:         "registry"
+      REGISTRY_PORT:         "5550"
+      HEARTBEAT_INTERVAL:    "1.0"
+      HEARTBEAT_TIMEOUT:     "5.0"
+    depends_on:
+      registry:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ── Cliente (imagem compartilhada — use docker-compose run) ─────────────────
+  client:
+    build:
+      context: .
+      dockerfile: client/Dockerfile
+    image: videoconf-client           # imagem reutilizada por múltiplos runs
+    networks:
+      - videoconf
+    environment:
+      REGISTRY_HOST:      "registry"
+      REGISTRY_PORT:      "5550"
+      HEARTBEAT_INTERVAL: "1.0"
+      HEARTBEAT_TIMEOUT:  "5.0"
+    depends_on:
+      registry:
+        condition: service_healthy
+      broker-1:
+        condition: service_started
+    stdin_open: true    # mantém stdin aberto para modo interativo
+    tty: true           # aloca pseudo-TTY para cores e input
+    profiles:
+      - client          # não sobe com  up  sozinho; use  run  ou  --profile client
