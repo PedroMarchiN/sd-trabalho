@@ -339,11 +339,14 @@ class Broker:
         sock.setsockopt(zmq.RCVTIMEO, 3000)
         sock.connect(REGISTRY_ADDR)
 
+        advertise = os.environ.get("BROKER_ADVERTISE_HOST", BROKER_HOST)
+        cluster   = os.environ.get("BROKER_CLUSTER_HOST", advertise)
         payload = {
-            "action":    "register",
-            "broker_id": self.broker_id,
-            "host":      os.environ.get("BROKER_ADVERTISE_HOST", BROKER_HOST),
-            "ports":     self.ports,
+            "action":       "register",
+            "broker_id":    self.broker_id,
+            "host":         advertise,
+            "cluster_host": cluster,
+            "ports":        self.ports,
         }
         raw = encode(MSG_CONTROL, self.broker_id, "__registry__", payload)
 

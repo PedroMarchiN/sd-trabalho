@@ -281,7 +281,8 @@ class BrokerCluster:
             resp = decode(sock.recv())
             brokers = resp.get("data", {}).get("brokers", {})
             for bid, info in brokers.items():
-                self.add_peer(bid, info["host"], info["ports"])
+                peer_host = info.get("cluster_host", info["host"])
+                self.add_peer(bid, peer_host, info["ports"])
         except zmq.ZMQError as e:
             log.debug("sync_peers falhou: %s", e)
         finally:
