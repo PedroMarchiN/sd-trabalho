@@ -36,6 +36,8 @@ import sys
 import time
 import logging
 import threading
+import queue
+import msgpack
 
 import zmq
 
@@ -65,6 +67,12 @@ class BrokerCluster:
         self.ctx       = broker.ctx
         self.ports     = broker.ports
         self._running  = False
+
+        # Fila thread-safe para injetar mensagens recebidas do cluster no broker principal
+        self.inbox = queue.Queue()
+        
+        # Armazena estado remoto dos peers para o comando /who
+        self._remote_presence = {}
 
         # { broker_id: { "host": str, "ports": dict, "ts": float } }
         self._peers: dict[str, dict] = {}
@@ -126,6 +134,27 @@ class BrokerCluster:
             if peer_id in self._peers:
                 self._peers[peer_id]["ts"] = time.time()
 
+    def get_remote_users(self, room_name: str) -> list:
+        """Retorna usuários de uma sala específica nos outros brokers."""
+        return self.get_all_remote_rooms().get(room_name, [])
+
+    def get_all_remote_rooms(self) -> dict:
+        """Retorna {sala: [membros]} agregado de todos os peers ativos."""
+        result: dict = {}
+        now     = time.time()
+        timeout = float(os.environ.get("HEARTBEAT_TIMEOUT", "5.0"))
+        for bid, info in list(self._remote_presence.items()):
+            if now - info["ts"] > timeout:
+                continue
+            rooms_data = info.get("rooms", {})
+            if not isinstance(rooms_data, dict):
+                continue
+            for room, members in rooms_data.items():
+                if room not in result:
+                    result[room] = []
+                result[room].extend(m for m in members if m not in result[room])
+        return result
+
     # ── Publicação para cluster ────────────────────────────────────────────────
     def forward(self, topic: bytes, raw: bytes) -> None:
         """
@@ -143,7 +172,6 @@ class BrokerCluster:
         hops.append(self.broker_id)
         msg["hops"] = hops
 
-        import msgpack
         new_raw = msgpack.packb(msg, use_bin_type=True)
         try:
             self._pub_sock.send_multipart([topic, new_raw], zmq.NOBLOCK)
@@ -153,8 +181,8 @@ class BrokerCluster:
     # ── Threads ────────────────────────────────────────────────────────────────
     def _thread_receive(self) -> None:
         """
-        Recebe mensagens dos peers e injeta no XSUB local
-        para que o proxy as redistribua aos clientes deste broker.
+        Recebe mensagens dos peers e coloca na fila inbox
+        para que o proxy as redistribua aos clientes deste broker com segurança.
         """
         poller = zmq.Poller()
         poller.register(self._sub_sock, zmq.POLLIN)
@@ -171,18 +199,23 @@ class BrokerCluster:
 
                 msg = decode(raw)
 
-                # ── Heartbeat de peer — apenas atualiza timestamp ──────────
+                # ── Heartbeat de peer — apenas atualiza timestamp e presença ──────────
                 if topic_b == b"__hb__":
                     sender = msg.get("data", {}).get("broker_id") or msg.get("from")
                     if sender and sender != self.broker_id:
                         self.peer_alive(sender)
+                        self._remote_presence[sender] = {
+                            "ts": time.time(),
+                            "rooms": msg.get("data", {}).get("rooms", {})
+                        }
                     continue
 
                 # ── Mensagem de mídia — verifica anti-loop e injeta ────────
                 if self.broker_id in msg.get("hops", []):
                     continue
 
-                self.broker._frontend.send_multipart([topic_b, raw], zmq.NOBLOCK)
+                # Injeta na fila thread-safe em vez de chamar o socket diretamente
+                self.inbox.put([topic_b, raw])
 
             except zmq.ZMQError as e:
                 if self._running:

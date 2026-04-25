@@ -31,6 +31,7 @@ import sys
 import time
 import threading
 import logging
+import queue
 import zmq
 
 # Adiciona o diretório raiz ao path para importar common.*
@@ -119,7 +120,7 @@ class Broker:
 
     Threads internas
     ─────────────────
-    • _thread_proxy    — zmq.proxy(frontend, backend)  [bloqueante]
+    • _thread_proxy    — redistribuição e interligação com cluster
     • _thread_control  — loop ROUTER para join/leave/hb
     • _thread_evict    — remove clientes inativos periodicamente
     """
@@ -197,15 +198,43 @@ class Broker:
     # ── Threads ────────────────────────────────────────────────────────────────
     def _thread_proxy(self) -> None:
         """
-        Redistribuição PUB/SUB pura.
-        zmq.proxy é bloqueante e extremamente eficiente (loop em C).
-        Também injeta mensagens vindas do cluster inter-broker.
+        Redistribuição PUB/SUB manual (substitui zmq.proxy).
+        Lê eventos, distribui localmente, envia para o cluster e 
+        também injeta mensagens vindas do cluster inter-broker.
         """
         log.debug("proxy thread iniciada")
-        try:
-            zmq.proxy(self._frontend, self._backend)
-        except zmq.ZMQError:
-            pass   # ctx.term() provoca erro esperado ao encerrar
+        poller = zmq.Poller()
+        poller.register(self._frontend, zmq.POLLIN)
+        poller.register(self._backend, zmq.POLLIN)
+
+        while self._running:
+            events = dict(poller.poll(timeout=10))
+
+            try:
+                # 1. Mensagens publicadas pelos clientes deste broker
+                if self._frontend in events:
+                    frames = self._frontend.recv_multipart()
+                    self._backend.send_multipart(frames)
+                    if len(frames) >= 2:
+                        self.cluster.forward(frames[0], frames[1])
+
+                # 2. Inscrições (XPUB -> XSUB)
+                if self._backend in events:
+                    frames = self._backend.recv_multipart()
+                    self._frontend.send_multipart(frames)
+
+                # 3. Mensagens vindas de outros brokers do cluster
+                while not self.cluster.inbox.empty():
+                    frames = self.cluster.inbox.get_nowait()
+                    self._backend.send_multipart(frames)
+
+            except zmq.ZMQError as e:
+                if not self._running:
+                    break
+                log.error("Erro no proxy: %s", e)
+            except Exception as e:
+                if self._running:
+                    log.error("Erro inesperado no proxy: %s", e)
 
     def _thread_control(self) -> None:
         """Processa mensagens de controle: join / leave / heartbeat."""
@@ -265,8 +294,22 @@ class Broker:
             self._send_ack(identity, client_id, room, "hb_ok")
 
         elif action == "list_rooms":
-            rooms_info = self.presence.all_rooms()
-            self._send_ack(identity, client_id, room, "rooms", extra={"rooms": rooms_info})
+            # Merge salas locais + remotas do cluster
+            local  = self.presence.all_rooms()
+            remote = self.cluster.get_all_remote_rooms()
+            merged = dict(local)
+            for r, members in remote.items():
+                if r in merged:
+                    merged[r] = sorted(set(merged[r]) | set(members))
+                else:
+                    merged[r] = members
+            self._send_ack(identity, client_id, room, "rooms", extra={"rooms": merged})
+
+        elif action == "who":
+            local_members = self.presence.members(room)
+            remote_members = self.cluster.get_remote_users(room)
+            all_members = sorted(list(set(local_members + remote_members)))
+            self._send_ack(identity, client_id, room, "who_resp", extra={"members": all_members})
 
         else:
             log.debug("Ação de controle desconhecida: %s", action)
