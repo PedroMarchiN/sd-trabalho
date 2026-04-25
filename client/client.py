@@ -34,12 +34,19 @@ import time
 import argparse
 import threading
 import logging
+import uuid
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from common.protocol import MSG_TEXT
+from common.protocol import MSG_TEXT, MSG_VIDEO
 from common.channels  import ROOMS
 from client.session   import Session, SessionError
+from client.media     import CameraCapture, VideoWindow
+
+# ── Prefixos de mensagens de sistema (câmera/mic) ─────────────────────────────
+_SYS_PREFIX  = "__sys__:"
+_CAM_ON_TAG  = "__cam_on__"
+_CAM_OFF_TAG = "__cam_off__"
 
 # ── Logging — só WARNING+ para não poluir a CLI ───────────────────────────────
 logging.basicConfig(
@@ -108,7 +115,12 @@ class ChatClient:
         self.client_id    = client_id
         self.initial_room = initial_room.upper() if initial_room else ""
         self.session      = Session(client_id)
-        self._running     = False
+
+        # Câmera
+        self._cam_on  = False
+        self._cam     = CameraCapture(self._on_local_frame)
+        self._vidwin  = VideoWindow()
+        self._running = False
 
     # ── Entrypoint ─────────────────────────────────────────────────────────────
     def run(self) -> None:
@@ -157,13 +169,14 @@ class ChatClient:
         arg    = parts[1].strip() if len(parts) > 1 else ""
 
         dispatch = {
-            "/join":  lambda: self._cmd_join(arg),
-            "/leave": lambda: self._cmd_leave(),
-            "/rooms": lambda: self._cmd_rooms(),
-            "/who":   lambda: self._cmd_who(),
-            "/help":  lambda: self._cmd_help(),
-            "/quit":  lambda: self._cmd_quit(),
-            "/exit":  lambda: self._cmd_quit(),
+            "/join":           lambda: self._cmd_join(arg),
+            "/leave":          lambda: self._cmd_leave(),
+            "/rooms":          lambda: self._cmd_rooms(),
+            "/who":            lambda: self._cmd_who(),
+            "/activatecamera": lambda: self._cmd_camera(),
+            "/help":           lambda: self._cmd_help(),
+            "/quit":           lambda: self._cmd_quit(),
+            "/exit":           lambda: self._cmd_quit(),
         }
 
         fn = dispatch.get(cmd)
@@ -181,16 +194,18 @@ class ChatClient:
 
         # Cancela subscrições da sala anterior
         if self.session.current_room:
-            old = self.session.current_room
-            self.session.unsubscribe(old, MSG_TEXT)
+            old_room = self.session.current_room
+            self.session.unsubscribe(old_room, MSG_TEXT)
+            self.session.unsubscribe(old_room, MSG_VIDEO)
 
         ok = self.session.join(room)
         if not ok:
             print_error(f"Não foi possível entrar na sala {room}")
             return
 
-        # Subscreve texto da nova sala
-        self.session.subscribe(room, MSG_TEXT, self._on_text_message)
+        # Subscreve texto e vídeo da nova sala
+        self.session.subscribe(room, MSG_TEXT,  self._on_text_message)
+        self.session.subscribe(room, MSG_VIDEO, self._on_video_message)
         print_system(f"Entrou na sala {c(C.BOLD, room)}", C.GREEN)
 
     def _cmd_leave(self) -> None:
@@ -203,7 +218,8 @@ class ChatClient:
         print_system(f"Saiu da sala {room}")
 
     def _cmd_rooms(self) -> None:
-        data = self.session.list_rooms()
+        # Consulta Registry diretamente — agrega salas de TODOS os brokers
+        data  = self.session.list_rooms()
         rooms = data.get("rooms", {})
         if not rooms:
             print_system("Nenhuma sala ativa no momento.")
@@ -221,8 +237,8 @@ class ChatClient:
         if not room:
             print_error("Você não está em nenhuma sala.")
             return
-        data    = self.session.list_rooms()
-        members = data.get("rooms", {}).get(room, [])
+        # Consulta Registry diretamente — agrega membros de TODOS os brokers
+        members = self.session.who(room)
         with _print_lock:
             print(c(C.CYAN, f"\n── Membros de {room} ({len(members)}) ──"))
             for m in members:
@@ -233,21 +249,25 @@ class ChatClient:
     def _cmd_help(self) -> None:
         with _print_lock:
             print(c(C.CYAN, """
-── Comandos ───────────────────────────────────
-  /join <sala>   Entra em uma sala (A–K)
-  /leave         Sai da sala atual
-  /rooms         Lista todas as salas ativas
-  /who           Membros da sala atual
-  /help          Este menu
-  /quit          Encerra o cliente
-────────────────────────────────────────────────
+── Comandos ──────────────────────────────────────────
+  /join <sala>       Entra em uma sala (A–K)
+  /leave             Sai da sala atual
+  /rooms             Lista todas as salas ativas
+  /who               Membros da sala atual
+  /activatecamera    Liga/desliga câmera (toggle)
+  /help              Este menu
+  /quit              Encerra o cliente
+──────────────────────────────────────────────────────
   Qualquer outro texto é enviado como mensagem.
-────────────────────────────────────────────────
+──────────────────────────────────────────────────────
 """))
 
     def _cmd_quit(self) -> None:
         print_system("Encerrando…", C.DIM)
         self._running = False
+        if self._cam_on:
+            self._cam.stop()
+        self._vidwin.close()
         self.session.disconnect()
 
     # ── Envio de texto ─────────────────────────────────────────────────────────
@@ -260,12 +280,63 @@ class ChatClient:
         except Exception as e:
             print_error(f"Erro ao enviar: {e}")
 
-    # ── Callback de recepção ───────────────────────────────────────────────────
+    # ── Callbacks de recepção ──────────────────────────────────────────────────
     def _on_text_message(self, msg: dict) -> None:
-        # Ignora mensagens do próprio cliente (eco)
         if msg.get("from") == self.client_id:
             return
-        print_msg(msg)
+        text = msg.get("data", "")
+        if text.startswith(_SYS_PREFIX):
+            body = text[len(_SYS_PREFIX):]
+            if body.startswith(_CAM_OFF_TAG):
+                # Peer desligou câmera — fecha janela
+                self._vidwin.remove(msg.get("from", ""))
+                print_system(body[len(_CAM_OFF_TAG):], C.MAGENTA)
+            else:
+                notice = body[len(_CAM_ON_TAG):] if body.startswith(_CAM_ON_TAG) else body
+                print_system(notice, C.MAGENTA)
+        else:
+            print_msg(msg)
+
+    def _on_video_message(self, msg: dict) -> None:
+        if msg.get("from") == self.client_id:
+            return
+        data = msg.get("data")
+        if data:
+            self._vidwin.push(msg["from"], data)
+
+    # ── Callbacks de captura local ──────────────────────────────────────────────
+    def _on_local_frame(self, jpeg: bytes) -> None:
+        if self._cam_on and self.session.current_room:
+            try:
+                self.session.publish(MSG_VIDEO, jpeg)
+            except Exception:
+                pass
+
+    # ── Câmera ─────────────────────────────────────────────────────────────────
+    def _cmd_camera(self) -> None:
+        if not self.session.current_room:
+            print_error("Entre em uma sala primeiro.")
+            return
+        self._cam_on = not self._cam_on
+        if self._cam_on:
+            ok, msg = self._cam.start()
+            if not ok:
+                self._cam_on = False
+                print_error(f"Câmera indisponível: {msg}")
+            else:
+                print_system("Câmera LIGADA 📷", C.GREEN)
+                self._send_sys(f"{_CAM_ON_TAG}{self.client_id} ativou a câmera 📷")
+        else:
+            self._cam.stop()
+            print_system("Câmera DESLIGADA", C.YELLOW)
+            self._send_sys(f"{_CAM_OFF_TAG}{self.client_id} desligou a câmera")
+
+    def _send_sys(self, text: str) -> None:
+        """Envia notificação de sistema para a sala."""
+        try:
+            self.session.publish(MSG_TEXT, f"{_SYS_PREFIX}{text}")
+        except Exception:
+            pass
 
     # ── Banner ─────────────────────────────────────────────────────────────────
     def _banner(self) -> None:
@@ -278,7 +349,6 @@ class ChatClient:
 
 # ── Entrypoint ─────────────────────────────────────────────────────────────────
 def main() -> None:
-    import uuid
     parser = argparse.ArgumentParser(description="Cliente CLI de videoconferência")
     parser.add_argument(
         "--id", dest="client_id",

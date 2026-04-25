@@ -77,7 +77,9 @@ class HeartbeatManager:
                 "action":    "broker_heartbeat",
                 "broker_id": self.broker_id,
                 "ts":        time.time(),
-                "rooms":     list(self.broker.presence.all_rooms().keys()),
+                # Envia mapa completo {sala: [membros]} para o Registry
+                # O Registry usa isso para responder /who e /list_rooms
+                "rooms":     self.broker.presence.all_rooms(),
             }
             raw = encode(MSG_CONTROL, self.broker_id, "__cluster__", payload)
             # Publica com tópico especial de heartbeat
@@ -107,6 +109,8 @@ class HeartbeatManager:
                 "clients":   sum(
                     len(v) for v in self.broker.presence.all_rooms().values()
                 ),
+                # Mapa completo {sala: [membros]} — Registry usa para /who e /rooms
+                "rooms":     self.broker.presence.all_rooms(),
             }
             raw = encode(MSG_CONTROL, self.broker_id, "__registry__", payload)
             sock.send(raw)

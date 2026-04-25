@@ -14,6 +14,8 @@ import sys
 import time
 import threading
 import logging
+import msgpack as _mp
+import zmq as _zmq
 
 import zmq
 
@@ -22,7 +24,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from common.protocol import (
     encode, decode,
     encode_with_topic,
-    MSG_TEXT, MSG_CONTROL,
+    MSG_TEXT, MSG_AUDIO, MSG_VIDEO, MSG_CONTROL,
     CTRL_JOIN, CTRL_LEAVE,
 )
 from common.channels import (
@@ -59,8 +61,12 @@ class Session:
         self._callbacks: dict[str, callable] = {}
         
         # Locks de proteção contra condições de corrida no failover
-        self._lock = threading.RLock() # Protege estado da conexão e sockets
-        self._cb_lock = threading.Lock() # Protege dicionário de callbacks
+        self._lock     = threading.RLock()  # Protege estado da conexão e sockets
+        self._cb_lock  = threading.Lock()   # Protege dicionário de callbacks
+        self._ctrl_lock = threading.Lock()  # Serializa acesso ao control_sock
+
+        # Contador de heartbeats perdidos (detecta falha de broker)
+        self._hb_missed = 0
 
         # Threads
         self._recv_thread: threading.Thread | None = None
@@ -107,37 +113,47 @@ class Session:
         log.info("Desconectado")
 
     def reconnect(self) -> None:
-        """Failover: Reconecta sockets a um novo broker sem vazar threads."""
+        """
+        Failover: descobre novo broker, reconecta sockets, restaura sala.
+        Também re-registra no Registry para que /who mostre o cliente no novo broker.
+        """
         log.warning("Iniciando failover para outro broker…")
-        
+
         with self._lock:
             self._connected = False
             room = self.current_room
-            
+
             with self._cb_lock:
                 cbs = dict(self._callbacks)
-            
+
             self._close_sockets()
-            time.sleep(1) # Tempo para os sockets antigos morrerem bem
-            
+            time.sleep(1)
+
             try:
                 self.broker_info = self._discover_broker()
                 self._open_sockets()
                 self._connected = True
-                
-                # Restaura estado
+
+                # Re-entra na sala no novo broker + atualiza Registry
                 if room:
                     self._send_control(CTRL_JOIN, room)
-                
+                    # Notifica o Registry sobre a mudança de broker
+                    self._registry_req({
+                        "action":    "join",
+                        "client_id": self.client_id,
+                        "room":      room,
+                        "broker_id": self.broker_info["broker_id"],
+                    })
+
                 # Restaura subscriptions
                 for topic_str in cbs:
                     if self._sub_sock:
                         self._sub_sock.setsockopt(zmq.SUBSCRIBE, topic_str.encode())
-                        
-                log.info("Failover concluído com sucesso!")
+
+                log.info("Failover concluído → broker %s",
+                         self.broker_info["broker_id"])
             except Exception as e:
                 log.error("Erro fatal durante failover: %s", e)
-                # Mantém _connected = False para que as threads tentem de novo no próximo ciclo
 
     # ══════════════════════════════════════════════════════════════════════════
     # API pública
@@ -196,7 +212,30 @@ class Session:
                 log.debug("publish descartado (fila cheia) — QoS %s", msg_type)
 
     def list_rooms(self) -> dict:
-        return self._send_control_and_wait("list_rooms", self.current_room or "__")
+        """Consulta o Registry diretamente — nunca usa o control_sock."""
+        return self._registry_req({"action": "list_rooms"})
+
+    def who(self, room: str = "") -> list:
+        """Consulta o Registry diretamente — nunca usa o control_sock."""
+        r = room or self.current_room or "__"
+        resp = self._registry_req({"action": "who", "room": r})
+        return resp.get("members", [])
+
+    def _registry_req(self, payload: dict) -> dict:
+        """Faz um request ao Registry com socket temporário."""
+        sock = self.ctx.socket(_zmq.REQ)
+        sock.setsockopt(_zmq.RCVTIMEO, 3000)
+        sock.setsockopt(_zmq.LINGER, 0)
+        sock.connect(REGISTRY_ADDR)
+        try:
+            sock.send(encode(MSG_CONTROL, self.client_id, "__registry__", payload))
+            resp = decode(sock.recv())
+            return resp.get("data", {})
+        except Exception as e:
+            log.warning("registry_req falhou: %s", e)
+            return {}
+        finally:
+            sock.close()
 
     # ══════════════════════════════════════════════════════════════════════════
     # Internos — sockets
@@ -237,29 +276,33 @@ class Session:
     # ══════════════════════════════════════════════════════════════════════════
 
     def _send_control(self, action: str, room: str) -> bool:
-        if not self._control_sock:
-            return False
-            
-        payload = {"action": action}
-        raw = encode(MSG_CONTROL, self.client_id, room, payload)
-        try:
-            self._control_sock.send_multipart([b"", raw])
-            frames = self._control_sock.recv_multipart()
-            resp   = decode(frames[-1])
-            return resp.get("data", {}).get("status") in ("joined", "left", "hb_ok", "ok")
-        except zmq.ZMQError as e:
-            log.warning("Controle falhou (%s): %s", action, e)
-            return False
+        """Envia comando de controle ao broker. Serializado por _ctrl_lock."""
+        with self._ctrl_lock:
+            sock = self._control_sock
+            if not sock:
+                return False
+            payload = {"action": action}
+            raw = encode(MSG_CONTROL, self.client_id, room, payload)
+            try:
+                sock.send_multipart([b"", raw])
+                frames = sock.recv_multipart()
+                resp   = decode(frames[-1])
+                return resp.get("data", {}).get("status") in ("joined", "left", "hb_ok", "ok")
+            except zmq.ZMQError as e:
+                log.warning("Controle falhou (%s): %s", action, e)
+                return False
 
     def _send_control_and_wait(self, action: str, room: str) -> dict:
-        with self._lock:
-            if not self._control_sock:
+        """Envio síncrono ao broker. Serializado por _ctrl_lock."""
+        with self._ctrl_lock:
+            sock = self._control_sock
+            if not sock:
                 return {}
             payload = {"action": action}
             raw = encode(MSG_CONTROL, self.client_id, room, payload)
             try:
-                self._control_sock.send_multipart([b"", raw])
-                frames = self._control_sock.recv_multipart()
+                sock.send_multipart([b"", raw])
+                frames = sock.recv_multipart()
                 return decode(frames[-1]).get("data", {})
             except zmq.ZMQError:
                 return {}
@@ -269,81 +312,94 @@ class Session:
     # ══════════════════════════════════════════════════════════════════════════
 
     def _thread_receive(self) -> None:
-        """Loop de recepção com poll seguro em relação a failovers."""
-        missed = 0
-
+        """
+        Loop de recepção de mensagens do SUB socket.
+        Poll curto (300ms) — timeout aqui é NORMAL em salas ociosas,
+        NÃO indica falha de broker. Quem detecta falha é _thread_heartbeat.
+        """
         while self._running:
             with self._lock:
-                sock = self._sub_sock
+                sock      = self._sub_sock
                 connected = self._connected
 
             if not connected or sock is None:
-                time.sleep(0.5)
+                time.sleep(0.3)
                 continue
 
             try:
-                event = sock.poll(timeout=int(HEARTBEAT_TIMEOUT * 1000))
+                if sock.poll(timeout=300) == 0:
+                    continue  # sem mensagem — normal, continua
 
-                if event == 0:
-                    # Timeout
-                    missed += 1
-                    if missed >= 3:
-                        log.warning("Broker sem resposta — tentando failover")
-
-                        self.reconnect()
-                        missed = 0
-                    continue
-
-                missed = 0
-
-                # Lê a mensagem
                 frames = sock.recv_multipart(zmq.NOBLOCK)
                 if len(frames) < 2:
                     continue
-                    
-                topic_b, raw = frames[0], frames[1]
-                topic_str    = topic_b.decode(errors="replace")
-                msg = decode(raw)
 
-                with self._cb_lock:
-                    cb = self._callbacks.get(topic_str)
+                topic_b  = frames[0]
+                topic_str = topic_b.decode(errors="replace")
 
-                if cb:
-                    try:
-                        cb(msg)
-                    except Exception as e:
-                        log.error("Erro no callback de %s: %s", topic_str, e)
+                # evita ExtraData com múltiplos pacotes
+                unpacker = _mp.Unpacker(raw=False)
+                unpacker.feed(frames[1])
+                for msg in unpacker:
+                    with self._cb_lock:
+                        cb = self._callbacks.get(topic_str)
+                    if cb:
+                        try:
+                            cb(msg)
+                        except Exception as e:
+                            log.error("Erro no callback de %s: %s", topic_str, e)
 
             except (zmq.ZMQError, AttributeError):
-                # Se o socket fechar no meio da operação, apenas ignora este ciclo
                 pass
 
     def _thread_heartbeat(self) -> None:
-        """Envia heartbeat periódico com segurança atômica."""
+        """
+        Envia heartbeat periódico ao broker.
+        Conta ACKs perdidos — após MAX_MISSED falhas consecutivas, faz failover.
+        Este é o ÚNICO mecanismo de detecção de falha de broker.
+        """
+        MAX_MISSED = int(os.environ.get("HEARTBEAT_RETRIES", "3"))
+
         while self._running:
             time.sleep(HEARTBEAT_INTERVAL)
-            
+
             with self._lock:
-                sock = self._control_sock
                 connected = self._connected
-                room = self.current_room
-            
-            if not connected or sock is None or not room:
+                room      = self.current_room
+                sock      = self._control_sock
+
+            if not connected or sock is None:
                 continue
 
-            try:
-                payload = {"action": "heartbeat"}
-                raw = encode(MSG_CONTROL, self.client_id, room, payload)
-                
-                sock.send_multipart([b"", raw], zmq.NOBLOCK)
-                
-                try:
-                    sock.recv_multipart(zmq.NOBLOCK)
-                except zmq.ZMQError:
-                    pass
-                    
-            except (zmq.ZMQError, AttributeError):
-                pass
+            # Fora de sala, apenas reseta contador
+            if not room:
+                self._hb_missed = 0
+                continue
+
+            ack_ok = False
+            with self._ctrl_lock:
+                if sock:
+                    try:
+                        payload = {"action": "heartbeat"}
+                        raw = encode(MSG_CONTROL, self.client_id, room, payload)
+                        sock.send_multipart([b"", raw])
+                        # Poll curto (500ms) para não segurar o lock por 3s inteiros
+                        if sock.poll(timeout=500):
+                            sock.recv_multipart()
+                            ack_ok = True
+                    except zmq.ZMQError:
+                        pass
+
+            if ack_ok:
+                self._hb_missed = 0
+            else:
+                self._hb_missed += 1
+                log.debug("Heartbeat sem ACK (%d/%d)", self._hb_missed, MAX_MISSED)
+                if self._hb_missed >= MAX_MISSED:
+                    log.warning("Broker sem resposta após %d heartbeats — failover",
+                                MAX_MISSED)
+                    self._hb_missed = 0
+                    self.reconnect()
 
     # ══════════════════════════════════════════════════════════════════════════
     # Internos — descoberta
@@ -351,33 +407,66 @@ class Session:
 
     def _discover_broker(self) -> dict:
         retries = int(os.environ.get("HEARTBEAT_RETRIES", "5"))
-        sock    = self.ctx.socket(zmq.REQ)
-        sock.setsockopt(zmq.RCVTIMEO, 3000)
-        sock.setsockopt(zmq.LINGER, 0)
-        sock.connect(REGISTRY_ADDR)
-
-        payload = {"action": "get_broker", "strategy": self.strategy}
-        raw     = encode(MSG_CONTROL, self.client_id, "__registry__", payload)
 
         for attempt in range(1, retries + 1):
+            sock = self.ctx.socket(zmq.REQ)
+            sock.setsockopt(zmq.RCVTIMEO, 3000)
+            sock.setsockopt(zmq.LINGER, 0)
+            sock.connect(REGISTRY_ADDR)
+
+            payload = {"action": "get_broker", "strategy": self.strategy}
+            raw     = encode(MSG_CONTROL, self.client_id, "__registry__", payload)
+
             try:
                 sock.send(raw)
                 resp = decode(sock.recv())
                 data = resp.get("data", {})
-                if data.get("status") == "ok":
-                    sock.close()
-                    log.info(
-                        "Broker descoberto: %s @ %s",
-                        data["broker_id"], data["host"],
-                    )
-                    return data
-                log.warning("Registry respondeu: %s", data)
             except zmq.ZMQError as e:
                 log.warning("Tentativa %d/%d de descoberta falhou: %s",
                             attempt, retries, e)
+                sock.close()
                 time.sleep(attempt * 0.5)
+                continue
+            finally:
+                sock.close()
 
-        sock.close()
+            if data.get("status") != "ok":
+                log.warning("Registry respondeu: %s", data)
+                time.sleep(0.5)
+                continue
+
+            # Verifica se o broker realmente está respondendo
+            if self._probe_broker(data):
+                log.info("Broker descoberto: %s @ %s",
+                         data["broker_id"], data["host"])
+                return data
+            else:
+                log.warning("Broker %s não respondeu ao probe — tentando outro",
+                            data["broker_id"])
+                time.sleep(1.0)
+
         raise SessionError(
-            f"Não foi possível descobrir um broker após {retries} tentativas"
+            f"Não foi possível descobrir um broker ativo após {retries} tentativas"
         )
+
+    def _probe_broker(self, broker_info: dict) -> bool:
+        """Testa se o broker está respondendo enviando um ping de controle."""
+        host  = broker_info.get("host", "")
+        ports = broker_info.get("ports", {})
+        if not host or not ports:
+            return False
+        sock = self.ctx.socket(zmq.DEALER)
+        sock.setsockopt(zmq.RCVTIMEO, 1500)
+        sock.setsockopt(zmq.LINGER, 0)
+        sock.setsockopt(zmq.IDENTITY, f"{self.client_id}-probe".encode())
+        sock.connect(f"tcp://{host}:{ports['control']}")
+        try:
+            raw = encode(MSG_CONTROL, self.client_id, "__probe__",
+                         {"action": "heartbeat"})
+            sock.send_multipart([b"", raw])
+            sock.recv_multipart()
+            return True
+        except zmq.ZMQError:
+            return False
+        finally:
+            sock.close()

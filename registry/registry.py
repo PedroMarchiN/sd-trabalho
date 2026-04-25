@@ -27,6 +27,14 @@ Protocolo (REQ → REP)
   Listagem (inter-broker):
     req → { action: "list_brokers" }
     rep ← { brokers: { id: { host, ports, clients, ts } } }
+
+  Membros de sala (cliente):
+    req → { action: "who", room: "A" }
+    rep ← { status: "ok", members: ["Nome1", "Nome2"] }
+
+  Todas as salas (cliente):
+    req → { action: "list_rooms" }
+    rep ← { status: "ok", rooms: { "A": ["Nome1", "Nome2"] } }
 """
 
 import os
@@ -116,6 +124,10 @@ class Registry:
             return self._handle_get_broker(data)
         elif action == "list_brokers":
             return self._handle_list_brokers()
+        elif action == "who":
+            return self._handle_who(data)
+        elif action == "list_rooms":
+            return self._handle_list_rooms()
         else:
             log.debug("Ação desconhecida: %s", action)
             return {"status": "unknown_action"}
@@ -128,6 +140,7 @@ class Registry:
                 "ports":   data.get("ports", {}),
                 "clients": 0,
                 "ts":      time.time(),
+                "rooms":   {},   # {room: [members]} — atualizado pelo heartbeat
             }
         log.info("REGISTER broker=%s host=%s", bid, data.get("host"))
         return {"status": "ok", "broker_id": bid}
@@ -138,6 +151,10 @@ class Registry:
             if bid in self._brokers:
                 self._brokers[bid]["ts"]      = time.time()
                 self._brokers[bid]["clients"] = data.get("clients", 0)
+                # Broker envia {room: [members]} no heartbeat — salva aqui
+                # Isso é a fonte da verdade para /who e /rooms
+                if "rooms" in data:
+                    self._brokers[bid]["rooms"] = data["rooms"]
         return {"status": "ok"}
 
     def _handle_get_broker(self, data: dict) -> dict:
@@ -157,6 +174,33 @@ class Registry:
         with self._lock:
             snapshot = {k: dict(v) for k, v in self._brokers.items()}
         return {"status": "ok", "brokers": snapshot}
+
+    def _handle_who(self, data: dict) -> dict:
+        """Agrega membros de uma sala de TODOS os brokers vivos."""
+        room = data.get("room", "")
+        members = set()
+        now = time.time()
+        timeout = float(os.environ.get("HEARTBEAT_TIMEOUT", str(HEARTBEAT_TIMEOUT)))
+        with self._lock:
+            for info in self._brokers.values():
+                if now - info["ts"] <= timeout:
+                    for m in info.get("rooms", {}).get(room, []):
+                        members.add(m)
+        return {"status": "ok", "members": sorted(members)}
+
+    def _handle_list_rooms(self) -> dict:
+        """Agrega todas as salas de todos os brokers vivos."""
+        rooms: dict[str, set] = {}
+        now = time.time()
+        timeout = float(os.environ.get("HEARTBEAT_TIMEOUT", str(HEARTBEAT_TIMEOUT)))
+        with self._lock:
+            for info in self._brokers.values():
+                if now - info["ts"] <= timeout:
+                    for room, members in info.get("rooms", {}).items():
+                        if room not in rooms:
+                            rooms[room] = set()
+                        rooms[room].update(members)
+        return {"status": "ok", "rooms": {r: sorted(m) for r, m in rooms.items()}}
 
     # ── Seleção de broker ──────────────────────────────────────────────────────
     def _select_broker(self, strategy: str):
