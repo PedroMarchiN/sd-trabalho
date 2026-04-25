@@ -99,15 +99,17 @@ Testa 5 cenários:
 
 ## Demonstrações
 
+Todas as demos sobem seus próprios processos — **não precisam de Docker**.
+
 ```bash
 # Failover: mata um broker, cliente reconecta automaticamente
-bash demo/demo_failover.sh
+python3 demo/demo_failover.py
 
 # Inter-broker: clientes em brokers distintos se comunicam
-bash demo/demo_inter_broker.sh
+python3 demo/demo_inter_broker.py
 
-# Multi-grupo: salas A, B e C em paralelo
-bash demo/demo_multi_grupo.sh
+# Multi-grupo: salas A, B e C em paralelo, clientes distribuídos
+python3 demo/demo_multi_grupo.py
 ```
 
 ---
