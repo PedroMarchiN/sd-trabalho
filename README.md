@@ -62,14 +62,11 @@ export HOST_IP=$(ip route get 1 | awk '{print $7; exit}')
 docker compose up --build registry broker-1 broker-2 broker-3
 ```
 
-### 3. Iniciar clientes (terminais separados, fora do Docker)
+### 3. Iniciar clientes interativos (opcional)
+
+Para conversar manualmente em tempo real, abra um terminal por participante:
 
 ```bash
-# Script auxiliar — cria venv, instala deps e inicia:
-./run_client.sh --id alice --room A
-./run_client.sh --id bob   --room A
-
-# Ou diretamente:
 REGISTRY_HOST=${HOST_IP:-127.0.0.1} REGISTRY_PORT=5550 \
 python -m client.client --id alice --room A
 ```
@@ -90,17 +87,6 @@ python3 demo/demo_inter_broker.py   # comunicação entre brokers
 python3 demo/demo_multi_grupo.py    # 3 salas em paralelo
 ```
 
-Para iniciar clientes manualmente no modo local:
-
-```bash
-# Sobe registry + brokers locais em segundo plano (portas padrão 5550-5579)
-python -m registry.registry &
-BROKER_ID=b1 BROKER_BASE_PORT=5555 BROKER_ADVERTISE_HOST=127.0.0.1 python -m broker.broker &
-BROKER_ID=b2 BROKER_BASE_PORT=5565 BROKER_ADVERTISE_HOST=127.0.0.1 python -m broker.broker &
-
-# Inicia cliente
-REGISTRY_HOST=127.0.0.1 REGISTRY_PORT=5550 python -m client.client --id alice --room A
-```
 
 ### Comandos disponíveis no cliente
 
