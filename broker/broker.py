@@ -184,6 +184,10 @@ class Broker:
         # XSUB — recebe publicações dos clientes
         self._frontend = self.ctx.socket(zmq.XSUB)
         self._frontend.bind(f"tcp://{BROKER_HOST}:{self.ports['frontend']}")
+        # Assinatura universal: XSUB só entrega mensagens que casam com uma
+        # subscrição ativa. Sem isso, quando não há assinante local para um
+        # tópico, o XSUB descarta a mensagem e cluster.forward() nunca é chamado.
+        self._frontend.send(b"\x01")
 
         # XPUB — distribui para assinantes
         self._backend = self.ctx.socket(zmq.XPUB)
@@ -335,11 +339,14 @@ class Broker:
         sock.setsockopt(zmq.RCVTIMEO, 3000)
         sock.connect(REGISTRY_ADDR)
 
+        advertise = os.environ.get("BROKER_ADVERTISE_HOST", BROKER_HOST)
+        cluster   = os.environ.get("BROKER_CLUSTER_HOST", advertise)
         payload = {
-            "action":    "register",
-            "broker_id": self.broker_id,
-            "host":      os.environ.get("BROKER_ADVERTISE_HOST", BROKER_HOST),
-            "ports":     self.ports,
+            "action":       "register",
+            "broker_id":    self.broker_id,
+            "host":         advertise,
+            "cluster_host": cluster,
+            "ports":        self.ports,
         }
         raw = encode(MSG_CONTROL, self.broker_id, "__registry__", payload)
 

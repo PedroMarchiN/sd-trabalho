@@ -29,11 +29,12 @@ networks:
 #   broker-3 : 5575-5579
 # ─────────────────────────────────────────────────────────────────────────────
 
-# ── IP da sua máquina na rede local ───────────────────────────────────────────
-# Troque pelo IP real antes de rodar. Exemplo: 192.168.1.100
-# Para descobrir: ip route get 1 | awk '{print $7; exit}'
+# ── IP da máquina host (acessível pelos clientes) ─────────────────────────────
+# Detecção automática: export HOST_IP=$(ip route get 1 | awk '{print $7; exit}')
+# Ou defina manualmente:  export HOST_IP=192.168.1.100
+# Se HOST_IP não estiver definido, usa 127.0.0.1 (somente localhost).
 x-broker-host: &broker-host
-  BROKER_ADVERTISE_HOST: "COLOQUE SEU ID AQUI"
+  BROKER_ADVERTISE_HOST: "${HOST_IP:-127.0.0.1}"
 
 services:
 
@@ -77,12 +78,13 @@ services:
       - "5559:5559"
     environment:
       <<: *broker-host
-      BROKER_ID:          "broker-1"
-      BROKER_BASE_PORT:   "5555"
-      REGISTRY_HOST:      "registry"
-      REGISTRY_PORT:      "5550"
-      HEARTBEAT_INTERVAL: "2.0"
-      HEARTBEAT_TIMEOUT:  "8.0"
+      BROKER_ID:           "broker-1"
+      BROKER_BASE_PORT:    "5555"
+      BROKER_CLUSTER_HOST: "broker-1"
+      REGISTRY_HOST:       "registry"
+      REGISTRY_PORT:       "5550"
+      HEARTBEAT_INTERVAL:  "2.0"
+      HEARTBEAT_TIMEOUT:   "8.0"
     depends_on:
       registry:
         condition: service_healthy
@@ -105,12 +107,13 @@ services:
       - "5569:5569"
     environment:
       <<: *broker-host
-      BROKER_ID:          "broker-2"
-      BROKER_BASE_PORT:   "5565"
-      REGISTRY_HOST:      "registry"
-      REGISTRY_PORT:      "5550"
-      HEARTBEAT_INTERVAL: "2.0"
-      HEARTBEAT_TIMEOUT:  "8.0"
+      BROKER_ID:           "broker-2"
+      BROKER_BASE_PORT:    "5565"
+      BROKER_CLUSTER_HOST: "broker-2"
+      REGISTRY_HOST:       "registry"
+      REGISTRY_PORT:       "5550"
+      HEARTBEAT_INTERVAL:  "2.0"
+      HEARTBEAT_TIMEOUT:   "8.0"
     depends_on:
       registry:
         condition: service_healthy
@@ -133,12 +136,13 @@ services:
       - "5579:5579"
     environment:
       <<: *broker-host
-      BROKER_ID:          "broker-3"
-      BROKER_BASE_PORT:   "5575"
-      REGISTRY_HOST:      "registry"
-      REGISTRY_PORT:      "5550"
-      HEARTBEAT_INTERVAL: "2.0"
-      HEARTBEAT_TIMEOUT:  "8.0"
+      BROKER_ID:           "broker-3"
+      BROKER_BASE_PORT:    "5575"
+      BROKER_CLUSTER_HOST: "broker-3"
+      REGISTRY_HOST:       "registry"
+      REGISTRY_PORT:       "5550"
+      HEARTBEAT_INTERVAL:  "2.0"
+      HEARTBEAT_TIMEOUT:   "8.0"
     depends_on:
       registry:
         condition: service_healthy

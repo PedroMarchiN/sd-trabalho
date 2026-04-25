@@ -135,12 +135,14 @@ class Registry:
     def _handle_register(self, data: dict) -> dict:
         bid = data.get("broker_id")
         with self._lock:
+            host = data.get("host", "localhost")
             self._brokers[bid] = {
-                "host":    data.get("host", "localhost"),
-                "ports":   data.get("ports", {}),
-                "clients": 0,
-                "ts":      time.time(),
-                "rooms":   {},   # {room: [members]} — atualizado pelo heartbeat
+                "host":         host,
+                "cluster_host": data.get("cluster_host", host),
+                "ports":        data.get("ports", {}),
+                "clients":      0,
+                "ts":           time.time(),
+                "rooms":        {},
             }
         log.info("REGISTER broker=%s host=%s", bid, data.get("host"))
         return {"status": "ok", "broker_id": bid}

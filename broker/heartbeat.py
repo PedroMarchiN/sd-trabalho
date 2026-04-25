@@ -22,6 +22,7 @@ import zmq
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
+
 from common.protocol import encode, decode, MSG_CONTROL
 from common.channels  import (
     BROKER_ID, REGISTRY_ADDR, HEARTBEAT_INTERVAL,
@@ -71,23 +72,16 @@ class HeartbeatManager:
             self._ping_registry()
 
     def _publish_cluster_heartbeat(self) -> None:
-        """Publica heartbeat no PUB do cluster para os peers saberem que estou vivo."""
+        """Publica heartbeat via outbox do cluster (thread-safe)."""
         try:
             payload = {
                 "action":    "broker_heartbeat",
                 "broker_id": self.broker_id,
                 "ts":        time.time(),
-                # Envia mapa completo {sala: [membros]} para o Registry
-                # O Registry usa isso para responder /who e /list_rooms
                 "rooms":     self.broker.presence.all_rooms(),
             }
             raw = encode(MSG_CONTROL, self.broker_id, "__cluster__", payload)
-            # Publica com tópico especial de heartbeat
-            self.broker.cluster._pub_sock.send_multipart(
-                [b"__hb__", raw], zmq.NOBLOCK
-            )
-        except zmq.ZMQError:
-            pass   # pub sem assinantes — normal
+            self.broker.cluster.publish_heartbeat(raw)
         except Exception as e:
             log.debug("Erro no heartbeat de cluster: %s", e)
 

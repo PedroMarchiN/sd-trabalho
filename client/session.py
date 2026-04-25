@@ -59,6 +59,9 @@ class Session:
 
         # Callbacks registrados por tópico
         self._callbacks: dict[str, callable] = {}
+
+        # Rastreamento de sequência de áudio por remetente (QoS)
+        self._audio_last_seq: dict[str, int] = {}
         
         # Locks de proteção contra condições de corrida no failover
         self._lock     = threading.RLock()  # Protege estado da conexão e sockets
@@ -67,6 +70,10 @@ class Session:
 
         # Contador de heartbeats perdidos (detecta falha de broker)
         self._hb_missed = 0
+
+        # Contadores de QoS
+        self._audio_seq  = 0    # número de sequência para áudio (detecta perdas)
+        self._vid_drops  = 0    # frames de vídeo descartados consecutivos
 
         # Threads
         self._recv_thread: threading.Thread | None = None
@@ -196,20 +203,63 @@ class Session:
             if self._sub_sock:
                 self._sub_sock.setsockopt(zmq.UNSUBSCRIBE, topic_str.encode())
 
-    def publish(self, msg_type: str, payload, room: str = "") -> None:
+    def publish(self, msg_type: str, payload, room: str = "") -> bool:
+        """
+        Publica com QoS diferenciado por tipo:
+          MSG_TEXT  → blocking com retry (garantia de entrega)
+          MSG_AUDIO → NOBLOCK + seqno (detecta perdas no receptor)
+          MSG_VIDEO → NOBLOCK (descarta se fila cheia)
+        Retorna True se enviado, False se descartado.
+        """
         with self._lock:
             if not self._connected or not self._pub_sock:
                 raise SessionError("Não conectado")
-                
+
             target_room = room or self.current_room
             if not target_room:
                 raise SessionError("Nenhuma sala ativa")
 
-            frames = encode_with_topic(msg_type, self.client_id, target_room, payload)
+            if msg_type == MSG_TEXT:
+                return self._publish_text(target_room, payload)
+            elif msg_type == MSG_AUDIO:
+                return self._publish_audio(target_room, payload)
+            else:
+                return self._publish_media(msg_type, target_room, payload)
+
+    def _publish_text(self, room: str, payload) -> bool:
+        """Texto: tenta até 3 vezes com backoff curto (garantia de entrega)."""
+        frames = encode_with_topic(MSG_TEXT, self.client_id, room, payload)
+        for attempt in range(3):
             try:
-                self._pub_sock.send_multipart(frames, zmq.NOBLOCK)
+                self._pub_sock.send_multipart(frames)
+                return True
             except zmq.ZMQError:
-                log.debug("publish descartado (fila cheia) — QoS %s", msg_type)
+                if attempt < 2:
+                    time.sleep(0.05 * (attempt + 1))
+        log.warning("MSG_TEXT descartado após 3 tentativas")
+        return False
+
+    def _publish_audio(self, room: str, payload) -> bool:
+        """Áudio: envia com seqno para detecção de perda no receptor."""
+        self._audio_seq += 1
+        frames = encode_with_topic(
+            MSG_AUDIO, self.client_id, room, payload,
+            extra={"seq": self._audio_seq},
+        )
+        try:
+            self._pub_sock.send_multipart(frames, zmq.NOBLOCK)
+            return True
+        except zmq.ZMQError:
+            return False
+
+    def _publish_media(self, msg_type: str, room: str, payload) -> bool:
+        """Vídeo e outros: drop silencioso se fila cheia."""
+        frames = encode_with_topic(msg_type, self.client_id, room, payload)
+        try:
+            self._pub_sock.send_multipart(frames, zmq.NOBLOCK)
+            return True
+        except zmq.ZMQError:
+            return False
 
     def list_rooms(self) -> dict:
         """Consulta o Registry diretamente — nunca usa o control_sock."""
@@ -341,6 +391,18 @@ class Session:
                 unpacker = _mp.Unpacker(raw=False)
                 unpacker.feed(frames[1])
                 for msg in unpacker:
+                    if msg.get("from") == self.client_id:
+                        continue   # suprime eco da própria mensagem
+                    # QoS áudio: detecta perda de pacotes por seqno
+                    if topic_str.endswith(f".{MSG_AUDIO}"):
+                        sender = msg.get("from", "")
+                        seq    = msg.get("seq")
+                        if seq is not None and sender in self._audio_last_seq:
+                            gap = seq - self._audio_last_seq[sender] - 1
+                            if gap > 0:
+                                log.debug("Áudio: %d pacotes perdidos de %s", gap, sender)
+                        if seq is not None:
+                            self._audio_last_seq[sender] = seq
                     with self._cb_lock:
                         cb = self._callbacks.get(topic_str)
                     if cb:

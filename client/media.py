@@ -1,17 +1,18 @@
 """
 client/media.py
 ─────────────────────────────────────────────────────────────────────────────
-Captura e renderização de câmera e vídeo.
+Captura e renderização de câmera, vídeo e áudio.
 
 CameraCapture  — captura webcam, chama on_frame(jpeg_bytes) a FPS frames/s
-VideoWindow    — exibe janelas opencv por peer; remove(peer_id) fecha a janela
-                 quando o peer desliga a câmera
+VideoWindow    — exibe janelas opencv por peer
+AudioCapture   — captura microfone, chama on_chunk(bytes) a cada chunk PCM
+AudioPlayer    — reproduz chunks PCM recebidos de peers
 
 Notas de implementação
 ──────────────────────
-  • opencv usa imshow() que requer DISPLAY. 
+  • opencv usa imshow() que requer DISPLAY.
   • QT_QPA_PLATFORM=xcb é forçado para evitar crash.
-  • Warnings do Qt são suprimidos.
+  • PyAudio é opcional: se não instalado, AudioCapture/Player indicam indisponível.
 """
 
 import os
@@ -23,7 +24,150 @@ import queue
 import cv2
 import numpy as np
 
+# ── PyAudio (opcional) ────────────────────────────────────────────────────────
+try:
+    import pyaudio as _pa
+    _AUDIO = True
+except ImportError:
+    _pa    = None
+    _AUDIO = False
+
+# Parâmetros de áudio (voz)
+_AUDIO_RATE     = 16_000
+_AUDIO_CHANNELS = 1
+_AUDIO_CHUNK    = 1024   # ~64 ms por chunk a 16 kHz
+
 log = logging.getLogger("client.media")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+class AudioCapture:
+    """
+    Captura áudio do microfone e chama on_chunk(bytes) para cada frame PCM.
+    QoS: publica sem garantia — descarta se o callback demorar.
+    """
+
+    def __init__(self, on_chunk):
+        self._cb      = on_chunk
+        self._running = False
+        self._pa      = None
+        self._stream  = None
+
+    def start(self) -> tuple:
+        if not _AUDIO:
+            return False, "PyAudio não instalado"
+        try:
+            self._pa = _pa.PyAudio()
+            self._stream = self._pa.open(
+                format=_pa.paInt16,
+                channels=_AUDIO_CHANNELS,
+                rate=_AUDIO_RATE,
+                input=True,
+                frames_per_buffer=_AUDIO_CHUNK,
+            )
+            self._running = True
+            threading.Thread(target=self._loop, daemon=True, name="mic").start()
+            return True, ""
+        except Exception as e:
+            return False, str(e)
+
+    def stop(self) -> None:
+        self._running = False
+        if self._stream:
+            try:
+                self._stream.stop_stream()
+                self._stream.close()
+            except Exception:
+                pass
+        if self._pa:
+            try:
+                self._pa.terminate()
+            except Exception:
+                pass
+        self._stream = None
+        self._pa     = None
+
+    def _loop(self) -> None:
+        while self._running:
+            try:
+                data = self._stream.read(_AUDIO_CHUNK, exception_on_overflow=False)
+                try:
+                    self._cb(data)
+                except Exception:
+                    pass
+            except Exception:
+                break
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+class AudioPlayer:
+    """
+    Reproduz chunks PCM recebidos de peers.
+    Usa fila pequena (maxsize=10); descarta o mais antigo se cheia — QoS áudio.
+    """
+
+    def __init__(self):
+        self._q       = queue.Queue(maxsize=10)
+        self._running = False
+        self._pa      = None
+        self._stream  = None
+
+    def start(self) -> bool:
+        if not _AUDIO:
+            return False
+        try:
+            self._pa = _pa.PyAudio()
+            self._stream = self._pa.open(
+                format=_pa.paInt16,
+                channels=_AUDIO_CHANNELS,
+                rate=_AUDIO_RATE,
+                output=True,
+                frames_per_buffer=_AUDIO_CHUNK,
+            )
+            self._running = True
+            threading.Thread(target=self._loop, daemon=True, name="speaker").start()
+            return True
+        except Exception as e:
+            log.warning("AudioPlayer não pôde iniciar: %s", e)
+            return False
+
+    def stop(self) -> None:
+        self._running = False
+        if self._stream:
+            try:
+                self._stream.stop_stream()
+                self._stream.close()
+            except Exception:
+                pass
+        if self._pa:
+            try:
+                self._pa.terminate()
+            except Exception:
+                pass
+        self._stream = None
+        self._pa     = None
+
+    def push(self, chunk: bytes) -> None:
+        """Enfileira chunk; descarta o mais antigo se a fila estiver cheia."""
+        if self._q.full():
+            try:
+                self._q.get_nowait()
+            except queue.Empty:
+                pass
+        try:
+            self._q.put_nowait(chunk)
+        except queue.Full:
+            pass
+
+    def _loop(self) -> None:
+        while self._running:
+            try:
+                chunk = self._q.get(timeout=0.1)
+                self._stream.write(chunk)
+            except queue.Empty:
+                pass
+            except Exception:
+                break
 
 # ── Configura env ────────────────────────────────────────────────────────────
 os.environ.setdefault("QT_LOGGING_RULES", "*.debug=false;qt.qpa.*=false")

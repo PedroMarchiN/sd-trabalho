@@ -38,10 +38,10 @@ import uuid
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from common.protocol import MSG_TEXT, MSG_VIDEO
+from common.protocol import MSG_TEXT, MSG_VIDEO, MSG_AUDIO
 from common.channels  import ROOMS
 from client.session   import Session, SessionError
-from client.media     import CameraCapture, VideoWindow
+from client.media     import CameraCapture, VideoWindow, AudioCapture, AudioPlayer
 
 # ── Prefixos de mensagens de sistema (câmera/mic) ─────────────────────────────
 _SYS_PREFIX  = "__sys__:"
@@ -116,10 +116,18 @@ class ChatClient:
         self.initial_room = initial_room.upper() if initial_room else ""
         self.session      = Session(client_id)
 
-        # Câmera
-        self._cam_on  = False
-        self._cam     = CameraCapture(self._on_local_frame)
-        self._vidwin  = VideoWindow()
+        # Câmera + controle adaptativo de qualidade
+        self._cam_on       = False
+        self._cam          = CameraCapture(self._on_local_frame)
+        self._vidwin       = VideoWindow()
+        self._vid_drops    = 0    # drops consecutivos de vídeo
+        self._vid_ok_streak = 0   # envios bem-sucedidos consecutivos
+
+        # Microfone / áudio
+        self._mic_on       = False
+        self._mic          = AudioCapture(self._on_local_audio)
+        self._audio_player = AudioPlayer()
+
         self._running = False
 
     # ── Entrypoint ─────────────────────────────────────────────────────────────
@@ -134,6 +142,7 @@ class ChatClient:
             print(c(C.RED, f"Erro ao conectar: {e}"))
             sys.exit(1)
 
+        self._audio_player.start()
         print(c(C.GREEN, f"✓ Conectado como {c(C.BOLD, self.client_id)}"))
         print(c(C.DIM, "Digite /help para ver os comandos disponíveis.\n"))
 
@@ -174,6 +183,7 @@ class ChatClient:
             "/rooms":          lambda: self._cmd_rooms(),
             "/who":            lambda: self._cmd_who(),
             "/activatecamera": lambda: self._cmd_camera(),
+            "/mic":            lambda: self._cmd_mic(),
             "/help":           lambda: self._cmd_help(),
             "/quit":           lambda: self._cmd_quit(),
             "/exit":           lambda: self._cmd_quit(),
@@ -203,9 +213,10 @@ class ChatClient:
             print_error(f"Não foi possível entrar na sala {room}")
             return
 
-        # Subscreve texto e vídeo da nova sala
+        # Subscreve texto, vídeo e áudio da nova sala
         self.session.subscribe(room, MSG_TEXT,  self._on_text_message)
         self.session.subscribe(room, MSG_VIDEO, self._on_video_message)
+        self.session.subscribe(room, MSG_AUDIO, self._on_audio_message)
         print_system(f"Entrou na sala {c(C.BOLD, room)}", C.GREEN)
 
     def _cmd_leave(self) -> None:
@@ -214,6 +225,8 @@ class ChatClient:
             print_error("Você não está em nenhuma sala.")
             return
         self.session.unsubscribe(room, MSG_TEXT)
+        self.session.unsubscribe(room, MSG_VIDEO)
+        self.session.unsubscribe(room, MSG_AUDIO)
         self.session.leave(room)
         print_system(f"Saiu da sala {room}")
 
@@ -255,6 +268,7 @@ class ChatClient:
   /rooms             Lista todas as salas ativas
   /who               Membros da sala atual
   /activatecamera    Liga/desliga câmera (toggle)
+  /mic               Liga/desliga microfone (toggle)
   /help              Este menu
   /quit              Encerra o cliente
 ──────────────────────────────────────────────────────
@@ -267,7 +281,10 @@ class ChatClient:
         self._running = False
         if self._cam_on:
             self._cam.stop()
+        if self._mic_on:
+            self._mic.stop()
         self._vidwin.close()
+        self._audio_player.stop()
         self.session.disconnect()
 
     # ── Envio de texto ─────────────────────────────────────────────────────────
@@ -304,11 +321,39 @@ class ChatClient:
         if data:
             self._vidwin.push(msg["from"], data)
 
+    def _on_audio_message(self, msg: dict) -> None:
+        if msg.get("from") == self.client_id:
+            return
+        data = msg.get("data")
+        if data:
+            self._audio_player.push(data)
+
     # ── Callbacks de captura local ──────────────────────────────────────────────
     def _on_local_frame(self, jpeg: bytes) -> None:
-        if self._cam_on and self.session.current_room:
+        if not self._cam_on or not self.session.current_room:
+            return
+        try:
+            sent = self.session.publish(MSG_VIDEO, jpeg)
+        except Exception:
+            return
+        # Qualidade adaptativa: degrada ao dropar, restaura ao enviar
+        if sent:
+            self._vid_drops = 0
+            self._vid_ok_streak += 1
+            if self._vid_ok_streak >= 30 and self._cam.QUALITY < 50:
+                self._cam.QUALITY = min(self._cam.QUALITY + 5, 50)
+                self._vid_ok_streak = 0
+        else:
+            self._vid_ok_streak = 0
+            self._vid_drops += 1
+            if self._vid_drops >= 3:
+                self._cam.QUALITY = max(self._cam.QUALITY - 10, 20)
+                self._vid_drops = 0
+
+    def _on_local_audio(self, chunk: bytes) -> None:
+        if self._mic_on and self.session.current_room:
             try:
-                self.session.publish(MSG_VIDEO, jpeg)
+                self.session.publish(MSG_AUDIO, chunk)
             except Exception:
                 pass
 
@@ -331,6 +376,25 @@ class ChatClient:
             print_system("Câmera DESLIGADA", C.YELLOW)
             self._send_sys(f"{_CAM_OFF_TAG}{self.client_id} desligou a câmera")
 
+    # ── Microfone ──────────────────────────────────────────────────────────────
+    def _cmd_mic(self) -> None:
+        if not self.session.current_room:
+            print_error("Entre em uma sala primeiro.")
+            return
+        self._mic_on = not self._mic_on
+        if self._mic_on:
+            ok, msg = self._mic.start()
+            if not ok:
+                self._mic_on = False
+                print_error(f"Microfone indisponível: {msg}")
+            else:
+                print_system("Microfone LIGADO 🎤", C.GREEN)
+                self._send_sys(f"__mic_on__{self.client_id} ativou o microfone 🎤")
+        else:
+            self._mic.stop()
+            print_system("Microfone DESLIGADO", C.YELLOW)
+            self._send_sys(f"__mic_off__{self.client_id} desligou o microfone")
+
     def _send_sys(self, text: str) -> None:
         """Envia notificação de sistema para a sala."""
         try:
@@ -342,7 +406,7 @@ class ChatClient:
     def _banner(self) -> None:
         print(c(C.CYAN + C.BOLD, """
 ╔═══════════════════════════════════════╗
-║     VideoConf — Cliente de Texto      ║
+║  VideoConf — Texto · Vídeo · Áudio   ║
 ║     ZeroMQ · Cluster Distribuído      ║
 ╚═══════════════════════════════════════╝"""))
 
