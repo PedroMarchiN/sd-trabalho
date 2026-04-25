@@ -1,17 +1,26 @@
-version: "3.9"
+networks:
+  videoconf:
+    driver: bridge
 
 # ─────────────────────────────────────────────────────────────────────────────
-# docker-compose.yml — Cluster de Brokers + Registry + Clientes CLI
+# docker-compose.yml — Registry + Cluster de Brokers
 #
-# Subir infra (broker + registry):
-#   docker-compose up --build registry broker-1 broker-2 broker-3
+# IMPORTANTE: BROKER_ADVERTISE_HOST deve ser o IP real da sua máquina na rede
+# local.
 #
-# Abrir cliente interativo (em outro terminal):
-#   docker-compose run --rm -it client python -m client.client --id alice --room A
-#   docker-compose run --rm -it client python -m client.client --id bob   --room A
+# Para descobrir seu IP:
+#   ip route get 1 | awk '{print $7; exit}'   # Linux
 #
-# Ou, para subir tudo junto (clientes saem imediatamente sem TTY):
-#   docker-compose up --build
+# Subir infra:
+#   docker compose up --build registry broker-1 broker-2 broker-3
+#
+# Abrir clientes (em terminais separados, fora do Docker):
+#   ./run_client.sh --id Nome1 --room A
+#   ./run_client.sh --id Nome2   --room A
+#
+# Demonstração de failover (derruba broker-1, cliente reconecta):
+#   docker compose stop broker-1
+#   (heartbeat detecta e reconecta para broker-2 ou broker-3)
 #
 # Portas:
 #   registry : 5550
@@ -20,9 +29,11 @@ version: "3.9"
 #   broker-3 : 5575-5579
 # ─────────────────────────────────────────────────────────────────────────────
 
-networks:
-  videoconf:
-    driver: bridge
+# ── IP da sua máquina na rede local ───────────────────────────────────────────
+# Troque pelo IP real antes de rodar. Exemplo: 192.168.1.100
+# Para descobrir: ip route get 1 | awk '{print $7; exit}'
+x-broker-host: &broker-host
+  BROKER_ADVERTISE_HOST: "COLOQUE SEU ID AQUI"
 
 services:
 
@@ -40,7 +51,7 @@ services:
     environment:
       REGISTRY_PORT:     "5550"
       BROKER_HOST:       "0.0.0.0"
-      HEARTBEAT_TIMEOUT: "5.0"
+      HEARTBEAT_TIMEOUT: "8.0"
     restart: unless-stopped
     healthcheck:
       test: ["CMD-SHELL", "python -c \"import zmq,msgpack;c=zmq.Context();s=c.socket(zmq.REQ);s.setsockopt(zmq.RCVTIMEO,2000);s.setsockopt(zmq.LINGER,0);s.connect('tcp://localhost:5550');s.send(msgpack.packb({'v':1,'id':'hc','type':'control','from':'hc','room':'_','ts':0,'data':{'action':'list_brokers'}},use_bin_type=True));s.recv()\""]
@@ -65,13 +76,13 @@ services:
       - "5558:5558"
       - "5559:5559"
     environment:
-      BROKER_ID:             "broker-1"
-      BROKER_ADVERTISE_HOST: "broker-1"
-      BROKER_BASE_PORT:      "5555"
-      REGISTRY_HOST:         "registry"
-      REGISTRY_PORT:         "5550"
-      HEARTBEAT_INTERVAL:    "1.0"
-      HEARTBEAT_TIMEOUT:     "5.0"
+      <<: *broker-host
+      BROKER_ID:          "broker-1"
+      BROKER_BASE_PORT:   "5555"
+      REGISTRY_HOST:      "registry"
+      REGISTRY_PORT:      "5550"
+      HEARTBEAT_INTERVAL: "2.0"
+      HEARTBEAT_TIMEOUT:  "8.0"
     depends_on:
       registry:
         condition: service_healthy
@@ -93,13 +104,13 @@ services:
       - "5568:5568"
       - "5569:5569"
     environment:
-      BROKER_ID:             "broker-2"
-      BROKER_ADVERTISE_HOST: "broker-2"
-      BROKER_BASE_PORT:      "5565"
-      REGISTRY_HOST:         "registry"
-      REGISTRY_PORT:         "5550"
-      HEARTBEAT_INTERVAL:    "1.0"
-      HEARTBEAT_TIMEOUT:     "5.0"
+      <<: *broker-host
+      BROKER_ID:          "broker-2"
+      BROKER_BASE_PORT:   "5565"
+      REGISTRY_HOST:      "registry"
+      REGISTRY_PORT:      "5550"
+      HEARTBEAT_INTERVAL: "2.0"
+      HEARTBEAT_TIMEOUT:  "8.0"
     depends_on:
       registry:
         condition: service_healthy
@@ -121,37 +132,14 @@ services:
       - "5578:5578"
       - "5579:5579"
     environment:
-      BROKER_ID:             "broker-3"
-      BROKER_ADVERTISE_HOST: "broker-3"
-      BROKER_BASE_PORT:      "5575"
-      REGISTRY_HOST:         "registry"
-      REGISTRY_PORT:         "5550"
-      HEARTBEAT_INTERVAL:    "1.0"
-      HEARTBEAT_TIMEOUT:     "5.0"
+      <<: *broker-host
+      BROKER_ID:          "broker-3"
+      BROKER_BASE_PORT:   "5575"
+      REGISTRY_HOST:      "registry"
+      REGISTRY_PORT:      "5550"
+      HEARTBEAT_INTERVAL: "2.0"
+      HEARTBEAT_TIMEOUT:  "8.0"
     depends_on:
       registry:
         condition: service_healthy
     restart: unless-stopped
-
-  # ── Cliente (imagem compartilhada — use docker-compose run) ─────────────────
-  client:
-    build:
-      context: .
-      dockerfile: client/Dockerfile
-    image: videoconf-client           # imagem reutilizada por múltiplos runs
-    networks:
-      - videoconf
-    environment:
-      REGISTRY_HOST:      "registry"
-      REGISTRY_PORT:      "5550"
-      HEARTBEAT_INTERVAL: "1.0"
-      HEARTBEAT_TIMEOUT:  "5.0"
-    depends_on:
-      registry:
-        condition: service_healthy
-      broker-1:
-        condition: service_started
-    stdin_open: true    # mantém stdin aberto para modo interativo
-    tty: true           # aloca pseudo-TTY para cores e input
-    profiles:
-      - client          # não sobe com  up  sozinho; use  run  ou  --profile client
