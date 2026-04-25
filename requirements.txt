@@ -1,0 +1,5 @@
+pyzmq>=25.1.2
+msgpack>=1.0.7
+opencv-python-headless>=4.8.0
+numpy>=1.24.0
+pyaudio>=0.2.14

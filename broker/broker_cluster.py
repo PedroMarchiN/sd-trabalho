@@ -68,26 +68,31 @@ class BrokerCluster:
         self.ports     = broker.ports
         self._running  = False
 
-        # Fila thread-safe para injetar mensagens recebidas do cluster no broker principal
+        # Fila thread-safe: mensagens recebidas do cluster → broker principal
         self.inbox = queue.Queue()
-        
+
+        # Fila thread-safe: mensagens a enviar para o cluster (única thread usa _pub_sock)
+        self._outbox: queue.Queue = queue.Queue(maxsize=200)
+
         # Armazena estado remoto dos peers para o comando /who
-        self._remote_presence = {}
+        self._remote_presence: dict = {}
+        self._remote_presence_lock = threading.Lock()
 
         # { broker_id: { "host": str, "ports": dict, "ts": float } }
-        self._peers: dict[str, dict] = {}
+        self._peers: dict = {}
         self._peers_lock = threading.Lock()
 
-        self._pub_sock: zmq.Socket | None = None   # publica para cluster
-        self._sub_sock: zmq.Socket | None = None   # assina cluster
+        self._pub_sock = None   # publica para cluster — usado APENAS em _thread_send
+        self._sub_sock = None   # assina cluster
 
     # ── Ciclo de vida ──────────────────────────────────────────────────────────
     def start(self) -> None:
         self._running = True
         self._setup_cluster_sockets()
 
-        threading.Thread(target=self._thread_receive,    daemon=True, name="cluster_recv").start()
-        threading.Thread(target=self._thread_peer_sync,  daemon=True, name="cluster_sync").start()
+        threading.Thread(target=self._thread_receive,  daemon=True, name="cluster_recv").start()
+        threading.Thread(target=self._thread_send,     daemon=True, name="cluster_send").start()
+        threading.Thread(target=self._thread_peer_sync, daemon=True, name="cluster_sync").start()
 
         log.info(
             "Cluster iniciado | pub=%d sub=%d",
@@ -143,7 +148,9 @@ class BrokerCluster:
         result: dict = {}
         now     = time.time()
         timeout = float(os.environ.get("HEARTBEAT_TIMEOUT", "5.0"))
-        for bid, info in list(self._remote_presence.items()):
+        with self._remote_presence_lock:
+            snapshot = dict(self._remote_presence)
+        for bid, info in snapshot.items():
             if now - info["ts"] > timeout:
                 continue
             rooms_data = info.get("rooms", {})
@@ -160,6 +167,7 @@ class BrokerCluster:
         """
         Repassa uma mensagem para outros brokers.
         Injeta o broker_id atual em 'hops' para evitar loops.
+        Thread-safe: coloca na outbox; _thread_send faz o envio real.
         """
         try:
             msg = decode(raw)
@@ -174,11 +182,35 @@ class BrokerCluster:
 
         new_raw = msgpack.packb(msg, use_bin_type=True)
         try:
-            self._pub_sock.send_multipart([topic, new_raw], zmq.NOBLOCK)
-        except zmq.ZMQError:
-            pass   # fila cheia — descarta (QoS para vídeo/áudio)
+            self._outbox.put_nowait((topic, new_raw))
+        except queue.Full:
+            pass   # fila cheia — descarta (QoS vídeo/áudio)
+
+    def publish_heartbeat(self, raw: bytes) -> None:
+        """
+        Publica heartbeat para o cluster.
+        Thread-safe: usa a mesma outbox que forward().
+        """
+        try:
+            self._outbox.put_nowait((b"__hb__", raw))
+        except queue.Full:
+            pass
 
     # ── Threads ────────────────────────────────────────────────────────────────
+    def _thread_send(self) -> None:
+        """
+        Única thread que usa _pub_sock para enviar ao cluster.
+        ZMQ sockets não são thread-safe; concentrar aqui evita corrida.
+        """
+        while self._running:
+            try:
+                topic, raw = self._outbox.get(timeout=0.05)
+                self._pub_sock.send_multipart([topic, raw], zmq.NOBLOCK)
+            except queue.Empty:
+                pass
+            except zmq.ZMQError:
+                pass   # sem assinantes ou HWM atingido
+
     def _thread_receive(self) -> None:
         """
         Recebe mensagens dos peers e coloca na fila inbox
@@ -204,10 +236,11 @@ class BrokerCluster:
                     sender = msg.get("data", {}).get("broker_id") or msg.get("from")
                     if sender and sender != self.broker_id:
                         self.peer_alive(sender)
-                        self._remote_presence[sender] = {
-                            "ts": time.time(),
-                            "rooms": msg.get("data", {}).get("rooms", {})
-                        }
+                        with self._remote_presence_lock:
+                            self._remote_presence[sender] = {
+                                "ts": time.time(),
+                                "rooms": msg.get("data", {}).get("rooms", {})
+                            }
                     continue
 
                 # ── Mensagem de mídia — verifica anti-loop e injeta ────────

@@ -29,11 +29,12 @@ networks:
 #   broker-3 : 5575-5579
 # ─────────────────────────────────────────────────────────────────────────────
 
-# ── IP da sua máquina na rede local ───────────────────────────────────────────
-# Troque pelo IP real antes de rodar. Exemplo: 192.168.1.100
-# Para descobrir: ip route get 1 | awk '{print $7; exit}'
+# ── IP da máquina host (acessível pelos clientes) ─────────────────────────────
+# Detecção automática: export HOST_IP=$(ip route get 1 | awk '{print $7; exit}')
+# Ou defina manualmente:  export HOST_IP=192.168.1.100
+# Se HOST_IP não estiver definido, usa 127.0.0.1 (somente localhost).
 x-broker-host: &broker-host
-  BROKER_ADVERTISE_HOST: "COLOQUE SEU ID AQUI"
+  BROKER_ADVERTISE_HOST: "${HOST_IP:-127.0.0.1}"
 
 services:
 

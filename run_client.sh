@@ -26,7 +26,7 @@ source .venv/bin/activate
 if ! python -c "import zmq" 2>/dev/null; then
     echo "==> Instalando dependências Python..."
     pip install --upgrade pip -q
-    pip install pyzmq msgpack opencv-python numpy
+    pip install pyzmq msgpack opencv-python-headless numpy pyaudio
     echo "==> Dependências instaladas."
 fi
 

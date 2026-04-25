@@ -184,6 +184,10 @@ class Broker:
         # XSUB — recebe publicações dos clientes
         self._frontend = self.ctx.socket(zmq.XSUB)
         self._frontend.bind(f"tcp://{BROKER_HOST}:{self.ports['frontend']}")
+        # Assinatura universal: XSUB só entrega mensagens que casam com uma
+        # subscrição ativa. Sem isso, quando não há assinante local para um
+        # tópico, o XSUB descarta a mensagem e cluster.forward() nunca é chamado.
+        self._frontend.send(b"\x01")
 
         # XPUB — distribui para assinantes
         self._backend = self.ctx.socket(zmq.XPUB)
