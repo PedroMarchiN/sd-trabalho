@@ -24,45 +24,82 @@ Documentação detalhada: [`docs/ARQUITETURA.md`](docs/ARQUITETURA.md)
 
 ## Pré-requisitos
 
-**Infraestrutura (Docker)**:
+**Python (clientes e modo local)**:
 ```bash
-docker compose up --build registry broker-1 broker-2 broker-3
-```
-
-**Clientes (Python nativo)**:
-```bash
-# macOS: portaudio para PyAudio
+# macOS — portaudio para PyAudio (áudio)
 brew install portaudio
 
 pip install -r requirements.txt
 ```
 
+**Docker (opcional — modo infra containerizada)**:
+- Docker Desktop instalado e rodando
+- `docker compose` disponível
+
 ---
 
-## Subir a infraestrutura
+## Modo 1 — Infraestrutura via Docker (recomendado)
+
+Registry e brokers rodam em containers; clientes rodam nativamente na mesma máquina ou em outras máquinas da rede local.
+
+### 1. Exportar o IP da máquina host
+
+Os clientes precisam alcançar os brokers pelo IP real da máquina onde o Docker está rodando.
 
 ```bash
-# Detecta IP da máquina para que clientes externos possam conectar
-export HOST_IP=$(ip route get 1 | awk '{print $7; exit}')   # Linux
-# macOS:
+# macOS
 export HOST_IP=$(ipconfig getifaddr en0)
 
+# Linux
+export HOST_IP=$(ip route get 1 | awk '{print $7; exit}')
+```
+
+> Se os clientes rodarem **na mesma máquina** que o Docker, `HOST_IP=127.0.0.1` funciona (padrão já configurado).
+
+### 2. Subir a infra
+
+```bash
 docker compose up --build registry broker-1 broker-2 broker-3
+```
+
+### 3. Iniciar clientes (terminais separados, fora do Docker)
+
+```bash
+# Script auxiliar — cria venv, instala deps e inicia:
+./run_client.sh --id alice --room A
+./run_client.sh --id bob   --room A
+
+# Ou diretamente:
+REGISTRY_HOST=${HOST_IP:-127.0.0.1} REGISTRY_PORT=5550 \
+python -m client.client --id alice --room A
 ```
 
 ---
 
-## Iniciar clientes
+## Modo 2 — Tudo local, sem Docker
+
+Os testes automatizados e as demos sobem registry e brokers como subprocessos Python — nenhum container necessário.
 
 ```bash
-# Usando o script auxiliar (cria venv, instala deps, inicia cliente):
-./run_client.sh --id alice --room A
-./run_client.sh --id bob   --room A
+# Suite de testes (12 cenários):
+python3 demo/test_phase0.py
 
-# Ou diretamente (com env vars):
-REGISTRY_HOST=localhost REGISTRY_PORT=5550 \
-HEARTBEAT_INTERVAL=2.0 HEARTBEAT_TIMEOUT=8.0 \
-python -m client.client --id alice --room A
+# Demos individuais:
+python3 demo/demo_failover.py       # failover automático
+python3 demo/demo_inter_broker.py   # comunicação entre brokers
+python3 demo/demo_multi_grupo.py    # 3 salas em paralelo
+```
+
+Para iniciar clientes manualmente no modo local:
+
+```bash
+# Sobe registry + brokers locais em segundo plano (portas padrão 5550-5579)
+python -m registry.registry &
+BROKER_ID=b1 BROKER_BASE_PORT=5555 BROKER_ADVERTISE_HOST=127.0.0.1 python -m broker.broker &
+BROKER_ID=b2 BROKER_BASE_PORT=5565 BROKER_ADVERTISE_HOST=127.0.0.1 python -m broker.broker &
+
+# Inicia cliente
+REGISTRY_HOST=127.0.0.1 REGISTRY_PORT=5550 python -m client.client --id alice --room A
 ```
 
 ### Comandos disponíveis no cliente
@@ -99,17 +136,31 @@ Testa 5 cenários:
 
 ## Demonstrações
 
-Todas as demos sobem seus próprios processos — **não precisam de Docker**.
+Há duas versões de cada demo: **local** (sem Docker, sobe tudo sozinha) e **Docker** (usa a infra já rodando).
+
+### Com Docker (recomendado)
+
+Requer `docker compose up` rodando antes.
 
 ```bash
-# Failover: mata um broker, cliente reconecta automaticamente
-python3 demo/demo_failover.py
+# Inter-broker: alice e bob em brokers distintos se comunicam
+python3 demo/demo_inter_broker_docker.py
 
-# Inter-broker: clientes em brokers distintos se comunicam
+# Multi-grupo: salas A, B e C em paralelo, todos inter-broker
+python3 demo/demo_multi_grupo_docker.py
+
+# Failover: derruba container, cliente reconecta automaticamente, restaura
+python3 demo/demo_failover_docker.py
+```
+
+### Sem Docker (standalone)
+
+Cada script sobe seu próprio registry e brokers como subprocessos Python.
+
+```bash
 python3 demo/demo_inter_broker.py
-
-# Multi-grupo: salas A, B e C em paralelo, clientes distribuídos
 python3 demo/demo_multi_grupo.py
+python3 demo/demo_failover.py
 ```
 
 ---
